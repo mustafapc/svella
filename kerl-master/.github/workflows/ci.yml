@@ -1,0 +1,163 @@
+---
+name: CI
+'on':
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - "*"
+  workflow_dispatch: {}
+concurrency:
+  group: ${{github.workflow}}-${{github.ref}}
+  cancel-in-progress: true
+env:
+  ERLC_USE_SERVER: true
+  KERL_DEBUG: 'yes'
+jobs:
+  ci:
+    name: CI OTP ${{matrix.otp_vsn}}, on ${{matrix.os}}
+    runs-on: ${{matrix.os}}
+    strategy:
+      fail-fast: false
+      matrix:
+        otp_vsn: ['25.0', '25', '26', '27', 'master']
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - name: Update env.
+        run: |
+          if [[ ${{matrix.os}} == macos* ]]; then
+            /bin/bash -c "$(curl -fsSL \
+              https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=yes \
+              brew install wxwidgets fish shellcheck shfmt coreutils openssl@3.0
+          else
+            sudo sed -i 's/azure\.//' /etc/apt/sources.list # Reduces chance of time-outs
+            sudo apt-get update -y
+            sudo apt-get upgrade -y
+            sudo apt-get install -y --no-install-recommends \
+              git curl libssl-dev make autoconf libncurses-dev gcc g++ default-jdk \
+              unixodbc-dev libwxgtk3.2-dev libwxgtk-webview3.2-dev xsltproc \
+              libxml2-utils libsctp-dev lksctp-tools software-properties-common shellcheck \
+              shfmt
+            sudo apt-add-repository -y ppa:fish-shell/release-3
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends fish
+            sudo apt-get install -y --no-install-recommends csh
+          fi
+          echo 'KERL_RELEASE_TARGET=debug opt' >> $GITHUB_ENV
+      - name: Git checkout
+        uses: actions/checkout@v4
+      - name: Update OTP releases
+        run: ./kerl update releases
+      - name: Choose OTP version
+        run: |
+          _VERSION="${{matrix.otp_vsn}}"
+          case "$_VERSION" in
+            master)
+              echo '_KERL_PREFIX_GIT=git' >> $GITHUB_ENV
+              echo '_KERL_PREFIX_GIT_TARGET=https://github.com/erlang/otp.git' >> $GITHUB_ENV
+              echo 'KERL_BUILD_DOCS=yes' >> $GITHUB_ENV
+              echo 'KERL_DOC_TARGETS="html chunks"' >> $GITHUB_ENV
+              _KERL_REL=git
+              ;;
+            *)
+              _VERSION=$(./kerl list releases all | grep "^${_VERSION}" | tail -1)
+              _KERL_REL=${_VERSION}
+              ;;
+          esac
+          echo "_KERL_VSN=${_VERSION}" >> $GITHUB_ENV
+          echo "_KERL_REL=${_KERL_REL}" >> $GITHUB_ENV
+      - name: Build chosen version
+        # yamllint disable rule:line-length
+        run: |
+          echo "OpenSSL is $(openssl version)"
+          export MAKEFLAGS=-j$(($(nproc) + 2))
+          if ! ./kerl build ${_KERL_PREFIX_GIT} \
+                            ${_KERL_PREFIX_GIT_TARGET} \
+                           "${_KERL_VSN}" \
+                           "${_KERL_VSN}"; then
+            ## Print build log if it fails
+            cat ~/.kerl/builds/*/*.log
+            exit 1
+          fi
+        # yamllint disable rule:line-length
+      - name: Install chosen version
+        run: ./kerl install "$_KERL_VSN" "install_$_KERL_VSN"
+      - name: Check installation status (pre- activation)
+        run: ./kerl status || exit 0
+      - name: Validate installation
+        run: |
+          source $(./kerl path install_"$_KERL_VSN")/activate
+          erl -s crypto -s init stop
+          erl_call
+      - name: Check installation status (post- activation)
+        run: |
+          source $(./kerl path install_"$_KERL_VSN")/activate
+          ./kerl status
+      - name: Test KERL_RELEASE_TARGET
+        # yamllint disable rule:line-length
+        run: |
+          source $(./kerl path install_"$_KERL_VSN")/activate
+          for r_type in $KERL_RELEASE_TARGET;
+          do
+            cerl -"$r_type" -noshell -eval '{ok, D} = file:open("build_type", [write]), io:format(D, "~s", [erlang:system_info(build_type)]), halt().'
+            if [ "${r_type}" != "$(cat build_type)" ]; then
+              echo "${r_type} != $(cat build_type)"
+              exit 1;
+            fi
+          done
+          kerl_deactivate
+      - name: Test emit-activate (sh/bash)
+        run: |
+          ./kerl emit-activate $_KERL_REL $_KERL_VSN $(./kerl path install_"$_KERL_VSN") > activate-new
+          diff activate-new $(./kerl path install_"$_KERL_VSN")/activate
+          shellcheck -o all activate-new
+          shfmt -i 4 -d activate-new
+          rm -f activate-new
+      - name: Test emit-activate (fish)
+        run: |
+          ./kerl emit-activate $_KERL_REL $_KERL_VSN $(./kerl path install_"$_KERL_VSN") fish > activate-fish-new
+          diff activate-fish-new $(./kerl path install_"$_KERL_VSN")/activate.fish
+          rm -f activate-fish-new
+      - name: Test emit-activate (csh)
+        run: |
+          ./kerl emit-activate $_KERL_REL $_KERL_VSN $(./kerl path install_"$_KERL_VSN") csh > activate-csh-new
+          diff activate-csh-new $(./kerl path install_"$_KERL_VSN")/activate.csh
+          rm -f activate-csh-new
+        # yamllint enable rule:line-length
+      - name: Test activate/cleanup (sh/bash)
+        run: tests/activate_test.sh $_KERL_REL $_KERL_VSN $(./kerl path install_"$_KERL_VSN")
+      - name: Test activate/cleanup (fish)
+        run: tests/activate_test.fish $_KERL_REL $_KERL_VSN $(./kerl path install_"$_KERL_VSN")
+      - name: Test activate/cleanup (csh)
+        run: tests/activate_test.csh $_KERL_REL $_KERL_VSN $(./kerl path install_"$_KERL_VSN")
+      - name: Test version parse (sh/bash)
+        run: tests/version_parse_test.sh
+      - name: Delete installation
+        run: ./kerl delete installation $(./kerl path install_"$_KERL_VSN")
+      - name: Delete build
+        run: ./kerl delete build "$_KERL_VSN"
+      - name: Test build+install chosen version
+        run: |
+          export MAKEFLAGS="-j$(getconf _NPROCESSORS_ONLN)"
+          if ! ./kerl build-install ${_KERL_PREFIX_GIT} \
+                                    ${_KERL_PREFIX_GIT_TARGET} \
+                                   "${_KERL_VSN}" \
+                                   "${_KERL_VSN}" \
+                                   "$PWD/build-install_${_KERL_VSN}"; then
+            ## Print build log if it fails
+            cat ~/.kerl/builds/*/*.log
+            exit 1
+          fi
+      - name: Check installation status (pre- activation)
+        run: ./kerl status || exit 0
+      - name: Validate installation (build+install)
+        run: |
+          source $(./kerl path build-install_"${_KERL_VSN}")/activate
+          erl -s crypto -s init stop
+          erl_call
+      - name: Check installation status (post- activation)
+        run: |
+          source $(./kerl path build-install_"${_KERL_VSN}")/activate
+          ./kerl status
